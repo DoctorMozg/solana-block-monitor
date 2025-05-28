@@ -1,6 +1,9 @@
 pub mod cache;
 pub mod config;
+pub mod logic;
+pub mod metrics;
 pub mod server;
 pub mod state;
 pub mod synchronizer;
 pub mod syndica_client;
+pub mod types;

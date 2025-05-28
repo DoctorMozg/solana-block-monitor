@@ -5,56 +5,59 @@ use axum::{
     routing::get,
 };
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, error, info};
 
-use crate::cache::BlockCache;
-use crate::state::AppState;
-use crate::syndica_client::ApiClient;
+use crate::logic::SyndicaAppLogic;
 
 pub async fn is_slot_confirmed(
     Path(slot): Path<u64>,
-    State(state): State<Arc<AppState>>,
+    State(logic): State<Arc<SyndicaAppLogic>>,
 ) -> Result<StatusCode, StatusCode> {
+    let start_time = Instant::now();
     debug!(slot, "Checking if slot is confirmed");
 
-    if state.cache.contains(slot) {
-        debug!(slot, "Slot found in cache");
-        return Ok(StatusCode::OK);
-    }
-
-    debug!(slot, "Slot not in cache, checking via RPC");
-
-    match state.client.get_blocks(slot, slot).await {
-        Ok(blocks) => {
-            if blocks.contains(&slot) {
-                debug!(slot, "Slot confirmed via RPC, adding to cache");
-                state.cache.insert(slot);
-                Ok(StatusCode::OK)
-            } else {
-                debug!(slot, "Slot not confirmed");
-                Err(StatusCode::NOT_FOUND)
-            }
+    let result = match logic.get_block(slot).await {
+        Ok(Some(_)) => {
+            debug!(slot, "Slot {} confirmed", slot);
+            Ok(StatusCode::OK)
+        }
+        Ok(None) => {
+            debug!(slot, "Slot {} not confirmed", slot);
+            Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
-            error!(slot, error = %e, "Failed to check slot via RPC");
+            error!(slot, error = %e, "Failed to check slot {}", slot);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
-    }
+    };
+
+    let elapsed = start_time.elapsed();
+    logic
+        .state()
+        .metrics()
+        .record_is_slot_confirmed_elapsed(elapsed);
+
+    debug!(
+        slot,
+        elapsed_ms = elapsed.as_millis(),
+        "Slot confirmation check completed"
+    );
+
+    result
 }
 
-pub fn create_router(state: Arc<AppState>) -> Router {
+pub fn create_router(logic: Arc<SyndicaAppLogic>) -> Router {
     Router::new()
-        .route("/isSlotConfirmed/:slot", get(is_slot_confirmed))
-        .with_state(state)
+        .route("/isSlotConfirmed/{slot}", get(is_slot_confirmed))
+        .with_state(logic)
 }
 
 pub async fn start_server(
     port: u16,
-    cache: Arc<BlockCache>,
-    client: Arc<dyn ApiClient + Send + Sync>,
+    logic: Arc<SyndicaAppLogic>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = Arc::new(AppState::new(cache, client));
-    let app = create_router(state);
+    let app = create_router(logic);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
     info!(port, "Server starting");
@@ -62,94 +65,4 @@ pub async fn start_server(
     axum::serve(listener, app).await?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::extract::{Path, State};
-    use axum::http::StatusCode;
-    use mockall::mock;
-    use std::sync::Arc;
-
-    mock! {
-        TestClient {}
-
-        #[async_trait::async_trait]
-        impl ApiClient for TestClient {
-            async fn get_block(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
-            async fn get_blocks(&self, start_slot: u64, end_slot: u64) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>>;
-        }
-    }
-
-    #[tokio::test]
-    async fn test_slot_confirmed_cache_hit() {
-        let cache = Arc::new(BlockCache::new(10));
-        cache.insert(12345);
-
-        let mut mock_client = MockTestClient::new();
-        mock_client.expect_get_blocks().never();
-
-        let state = Arc::new(AppState::new(cache, Arc::new(mock_client)));
-
-        let result = is_slot_confirmed(Path(12345), State(state)).await;
-
-        assert_eq!(result, Ok(StatusCode::OK));
-    }
-
-    #[tokio::test]
-    async fn test_slot_confirmed_cache_miss_confirmed() {
-        let cache = Arc::new(BlockCache::new(10));
-
-        let mut mock_client = MockTestClient::new();
-        mock_client
-            .expect_get_blocks()
-            .with(mockall::predicate::eq(12345), mockall::predicate::eq(12345))
-            .times(1)
-            .returning(|_, _| Ok(vec![12345]));
-
-        let state = Arc::new(AppState::new(cache.clone(), Arc::new(mock_client)));
-
-        let result = is_slot_confirmed(Path(12345), State(state)).await;
-
-        assert_eq!(result, Ok(StatusCode::OK));
-        assert!(cache.contains(12345));
-    }
-
-    #[tokio::test]
-    async fn test_slot_not_confirmed() {
-        let cache = Arc::new(BlockCache::new(10));
-
-        let mut mock_client = MockTestClient::new();
-        mock_client
-            .expect_get_blocks()
-            .with(mockall::predicate::eq(12345), mockall::predicate::eq(12345))
-            .times(1)
-            .returning(|_, _| Ok(vec![]));
-
-        let state = Arc::new(AppState::new(cache.clone(), Arc::new(mock_client)));
-
-        let result = is_slot_confirmed(Path(12345), State(state)).await;
-
-        assert_eq!(result, Err(StatusCode::NOT_FOUND));
-        assert!(!cache.contains(12345));
-    }
-
-    #[tokio::test]
-    async fn test_rpc_error() {
-        let cache = Arc::new(BlockCache::new(10));
-
-        let mut mock_client = MockTestClient::new();
-        mock_client
-            .expect_get_blocks()
-            .with(mockall::predicate::eq(12345), mockall::predicate::eq(12345))
-            .times(1)
-            .returning(|_, _| Err("RPC error".into()));
-
-        let state = Arc::new(AppState::new(cache, Arc::new(mock_client)));
-
-        let result = is_slot_confirmed(Path(12345), State(state)).await;
-
-        assert_eq!(result, Err(StatusCode::INTERNAL_SERVER_ERROR));
-    }
 }

@@ -1,227 +1,289 @@
+use scc::Queue;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{interval};
-use tracing::{debug, error, info, warn};
+use tokio::task::JoinHandle;
+use tokio::time::interval;
+use tracing::{debug, error, info};
 
-use crate::cache::BlockCache;
-use crate::syndica_client::ApiClient;
+use crate::logic::SyndicaAppLogic;
 
+const WORKERS_COUNT: usize = 5;
+const INTERVAL_SIZE: u64 = 100;
+const MIN_INTERVAL_SIZE: u64 = 5;
+const POLL_DIVIDER: u64 = 10;
+
+#[derive(Debug, Clone)]
+struct SlotInterval {
+    start: u64,
+    end: u64,
+}
+
+impl SlotInterval {
+    fn new(start: u64, end: u64) -> Self {
+        Self { start, end }
+    }
+
+    fn size(&self) -> u64 {
+        if self.end >= self.start {
+            self.end - self.start + 1
+        } else {
+            0
+        }
+    }
+}
+
+/// The Synchronizer is designed to efficiently monitor Solana blockchain
+/// blocks while minimizing RPC traffic.
+///
+/// Key Design Decisions:
+/// 1. Interval-based Processing:
+///    - Instead of checking every slot individually, we process slots in intervals
+///    - This significantly reduces RPC calls by batching slot checks
+///    - Intervals are dynamically sized based on monitoring depth
+///
+/// 2. Queue-based Architecture:
+///    - Uses a concurrent queue to manage slot intervals
+///    - Enables parallel processing of different slot ranges
+///    - Provides backpressure when processing falls behind
+///
+/// 3. Dual Task System:
+///    - Slot Updater: Continuously monitors new slots
+///    - History Updater: Processes historical slots in parallel
+///    - Separation allows independent scaling of real-time vs historical processing
+///
+/// Future Optimizations:
+/// 1. Adaptive Interval Sizing:
+///    - Dynamically adjust interval size based on network conditions
+///    - Implement exponential backoff for failed intervals
+///    - Add interval merging for sparse regions
+///
+/// 2. Performance Enhancements:
+///    - Add batch processing for multiple intervals
+///    - Implement priority queue for newer slots
+///    - Add circuit breaker for RPC rate limiting
 pub struct Synchronizer {
-    cache: Arc<BlockCache>,
-    client: Arc<dyn ApiClient + Send + Sync>,
-    monitor_interval: Duration,
-    last_processed_slot: Option<u64>,
+    logic: Arc<SyndicaAppLogic>,
+    monitor_interval_ms: u64,
+    monitoring_depth: usize,
+    interval_queue: Arc<Queue<SlotInterval>>,
 }
 
 impl Synchronizer {
     pub fn new(
-        cache: Arc<BlockCache>,
-        client: Arc<dyn ApiClient + Send + Sync>,
+        logic: Arc<SyndicaAppLogic>,
         monitor_interval_ms: u64,
+        monitoring_depth: usize,
     ) -> Self {
         Self {
-            cache,
-            client,
-            monitor_interval: Duration::from_millis(monitor_interval_ms),
-            last_processed_slot: None,
+            logic,
+            monitor_interval_ms,
+            monitoring_depth,
+            interval_queue: Arc::new(Queue::<SlotInterval>::default()),
         }
     }
 
-    pub async fn start(&mut self) {
+    pub async fn run(&mut self) {
         info!("Starting block synchronizer");
+        let slot_updater_handle = self.spawn_slot_updater().await;
+        let history_updater_handle = self.spawn_history_updater().await;
 
-        let mut interval_timer = interval(self.monitor_interval);
+        tokio::select! {
+            _ = slot_updater_handle => {
+                error!("Slot updater task ended unexpectedly");
+            }
+            _ = history_updater_handle => {
+                error!("History updater task ended unexpectedly");
+            }
+        }
+    }
+
+    async fn spawn_slot_updater(&mut self) -> JoinHandle<()> {
+        let logic = Arc::clone(&self.logic);
+        let monitor_interval_ms = self.monitor_interval_ms;
+        let interval_queue = Arc::clone(&self.interval_queue);
+        let monitoring_depth = self.monitoring_depth;
+
+        tokio::spawn(async move {
+            let mut interval_timer = interval(Duration::from_millis(monitor_interval_ms));
+            info!(
+                "Slot updater started - updating every {}ms",
+                monitor_interval_ms
+            );
+            let mut last_tracked_slot: u64 = 0;
+
+            loop {
+                match logic.update_latest_slot().await {
+                    Ok(start_slot) => {
+                        info!(start_slot, "Updated latest slot");
+                        let begin_slot = std::cmp::max(
+                            last_tracked_slot + 1,
+                            start_slot - monitoring_depth as u64,
+                        );
+                        if begin_slot <= start_slot {
+                            let interval = SlotInterval::new(begin_slot, start_slot);
+                            info!(
+                                start = interval.start,
+                                end = interval.end,
+                                size = interval.size(),
+                                "Added interval to queue"
+                            );
+                            interval_queue.push(interval);
+                        }
+                        last_tracked_slot = start_slot;
+                    }
+                    Err(e) => {
+                        error!("Failed to update starting slot: {}", e);
+                    }
+                }
+                interval_timer.tick().await;
+            }
+        })
+    }
+
+    async fn spawn_history_updater(&mut self) -> JoinHandle<()> {
+        let logic = Arc::clone(&self.logic);
+        let monitoring_depth = self.monitoring_depth;
+        let monitor_interval_ms = self.monitor_interval_ms;
+        let interval_queue = Arc::clone(&self.interval_queue);
+
+        tokio::spawn(async move {
+            info!("History updater started with {} workers", WORKERS_COUNT);
+
+            let mut worker_handles = Vec::new();
+            for worker_id in 0..WORKERS_COUNT {
+                let worker_logic = Arc::clone(&logic);
+                let worker_queue = Arc::clone(&interval_queue);
+
+                let handle = tokio::spawn(async move {
+                    Self::interval_worker(
+                        worker_id,
+                        worker_logic,
+                        worker_queue,
+                        monitoring_depth,
+                        monitor_interval_ms,
+                    )
+                    .await;
+                });
+                worker_handles.push(handle);
+            }
+
+            for handle in worker_handles {
+                if let Err(e) = handle.await {
+                    error!("Worker task ended unexpectedly: {}", e);
+                }
+            }
+        })
+    }
+
+    async fn interval_worker(
+        worker_id: usize,
+        logic: Arc<SyndicaAppLogic>,
+        queue: Arc<Queue<SlotInterval>>,
+        monitoring_depth: usize,
+        monitor_interval_ms: u64,
+    ) {
+        info!(worker_id, "History worker started");
 
         loop {
-            interval_timer.tick().await;
+            if let Some(interval) = queue.pop() {
+                info!(
+                    worker_id,
+                    start = interval.start,
+                    end = interval.end,
+                    size = interval.size(),
+                    "Worker got interval from queue"
+                );
 
-            if self.last_processed_slot.is_none() {
-                if let Err(e) = self.initialize_starting_slot().await {
-                    error!("Failed to initialize starting slot: {}", e);
+                match Self::process_interval(&logic, &interval).await {
+                    Ok(sub_intervals) => {
+                        for sub_interval in sub_intervals {
+                            let interval_size_ok = sub_interval.size() >= MIN_INTERVAL_SIZE;
+                            let interval_end_ok = sub_interval.end
+                                > logic.state().last_processed_slot() - monitoring_depth as u64;
+                            if interval_size_ok && interval_end_ok {
+                                queue.push(sub_interval.clone());
+                                debug!(
+                                    worker_id,
+                                    start = sub_interval.start,
+                                    end = sub_interval.end,
+                                    size = sub_interval.size(),
+                                    "Added sub-interval to queue"
+                                );
+                            } else if !interval_size_ok {
+                                info!(
+                                    worker_id,
+                                    start = sub_interval.start,
+                                    end = sub_interval.end,
+                                    size = sub_interval.size(),
+                                    "Sub-interval size is too small"
+                                );
+                            } else if !interval_end_ok {
+                                info!(
+                                    worker_id,
+                                    start = sub_interval.start,
+                                    end = sub_interval.end,
+                                    size = sub_interval.size(),
+                                    "Sub-interval end is too far behind"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            worker_id,
+                            start = interval.start,
+                            end = interval.end,
+                            error = %e,
+                            "Failed to process interval"
+                        );
+                        queue.push(SlotInterval::new(interval.start, interval.end));
+                    }
                 }
-            }
-
-            if let Err(e) = self.sync_blocks().await {
-                error!("Error during block synchronization: {}", e);
+                debug!(worker_id, "No interval to process - sleeping briefly");
+                tokio::time::sleep(Duration::from_millis(monitor_interval_ms / POLL_DIVIDER)).await;
+            } else {
+                info!(worker_id, "No interval to process - sleeping");
+                tokio::time::sleep(Duration::from_millis(monitor_interval_ms)).await;
             }
         }
     }
 
-    async fn initialize_starting_slot(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let current_slot = self.client.get_block().await?;
+    async fn process_interval(
+        logic: &Arc<SyndicaAppLogic>,
+        interval: &SlotInterval,
+    ) -> Result<Vec<SlotInterval>, Box<dyn std::error::Error + Send + Sync>> {
+        let confirmed_blocks = logic.get_blocks(interval.start, interval.end).await?;
+        logic.query_slot_range(interval.start, interval.end).await?;
+        let mut sub_intervals = Vec::new();
+        let mut current_pos = interval.start;
 
-        let start_slot = if current_slot >= 100 {
-            current_slot - 100
-        } else {
-            0
-        };
+        for &confirmed_slot in &confirmed_blocks {
+            if confirmed_slot > current_pos {
+                let gap_start = current_pos;
+                let gap_end = confirmed_slot - 1;
+                let desired_end = std::cmp::min(
+                    std::cmp::max(gap_end, gap_start + INTERVAL_SIZE - 1),
+                    interval.end,
+                );
+                sub_intervals.push(SlotInterval::new(gap_start, desired_end));
+                current_pos = desired_end + 1;
+            } else {
+                current_pos = confirmed_slot + 1;
+            }
+        }
 
-        self.last_processed_slot = Some(start_slot);
+        if current_pos <= interval.end {
+            sub_intervals.push(SlotInterval::new(current_pos, interval.end));
+        }
+
         info!(
-            current_slot,
-            start_slot, "Initialized synchronizer starting from slot"
+            start = interval.start,
+            end = interval.end,
+            confirmed_count = confirmed_blocks.len(),
+            sub_intervals_count = sub_intervals.len(),
+            "Processed interval"
         );
 
-        Ok(())
-    }
-
-    async fn sync_blocks(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.last_processed_slot.is_none() {
-            return Ok(());
-        }
-
-        let current_slot = self.client.get_block().await?;
-        let last_slot = self.last_processed_slot.unwrap_or(0);
-
-        if current_slot <= last_slot {
-            debug!(current_slot, last_slot, "No new slots to process");
-            return Ok(());
-        }
-
-        let batch_size = 100;
-        let mut start_slot = last_slot + 1;
-
-        while start_slot <= current_slot {
-            let end_slot = std::cmp::min(start_slot + batch_size - 1, current_slot);
-
-            match self.process_slot_range(start_slot, end_slot).await {
-                Ok(confirmed_count) => {
-                    debug!(
-                        start_slot,
-                        end_slot, confirmed_count, "Processed slot range"
-                    );
-                    self.last_processed_slot = Some(end_slot);
-                    start_slot = end_slot + 1;
-                }
-                Err(e) => {
-                    warn!(
-                        start_slot,
-                        end_slot,
-                        error = %e,
-                        "Failed to process slot range, will retry"
-                    );
-                    return Err(e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn process_slot_range(
-        &self,
-        start_slot: u64,
-        end_slot: u64,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let confirmed_blocks = self.client.get_blocks(start_slot, end_slot).await?;
-
-        let mut inserted_count = 0;
-        for block_slot in confirmed_blocks {
-            if !self.cache.contains(block_slot) &&
-                self.cache.insert(block_slot) {
-                inserted_count += 1;
-            }
-        }
-
-        if inserted_count > 0 {
-            info!(
-                start_slot,
-                end_slot,
-                inserted_count,
-                cache_size = self.cache.len(),
-                "Added new confirmed blocks to cache"
-            );
-        }
-
-        Ok(inserted_count)
-    }
-
-    pub fn get_last_processed_slot(&self) -> Option<u64> {
-        self.last_processed_slot
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cache::BlockCache;
-    use async_trait::async_trait;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    struct MockClient {
-        current_slot: Arc<Mutex<u64>>,
-        confirmed_blocks: Arc<Mutex<HashMap<(u64, u64), Vec<u64>>>>,
-    }
-
-    impl MockClient {
-        fn new() -> Self {
-            Self {
-                current_slot: Arc::new(Mutex::new(1000)),
-                confirmed_blocks: Arc::new(Mutex::new(HashMap::new())),
-            }
-        }
-
-        fn set_current_slot(&self, slot: u64) {
-            *self.current_slot.lock().unwrap() = slot;
-        }
-
-        fn set_confirmed_blocks(&self, start: u64, end: u64, blocks: Vec<u64>) {
-            self.confirmed_blocks
-                .lock()
-                .unwrap()
-                .insert((start, end), blocks);
-        }
-    }
-
-    #[async_trait]
-    impl ApiClient for MockClient {
-        async fn get_block(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(*self.current_slot.lock().unwrap())
-        }
-
-        async fn get_blocks(
-            &self,
-            start_slot: u64,
-            end_slot: u64,
-        ) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
-            let blocks = self.confirmed_blocks.lock().unwrap();
-            Ok(blocks
-                .get(&(start_slot, end_slot))
-                .cloned()
-                .unwrap_or_default())
-        }
-    }
-
-    #[tokio::test]
-    async fn test_synchronizer_initialization() {
-        let cache = Arc::new(BlockCache::new(100));
-        let client = Arc::new(MockClient::new());
-        client.set_current_slot(1000);
-
-        let mut sync = Synchronizer::new(cache, client, 100);
-        sync.initialize_starting_slot().await.unwrap();
-
-        assert_eq!(sync.get_last_processed_slot(), Some(900));
-    }
-
-    #[tokio::test]
-    async fn test_process_slot_range() {
-        let cache = Arc::new(BlockCache::new(100));
-        let client = Arc::new(MockClient::new());
-
-        client.set_confirmed_blocks(100, 105, vec![100, 102, 104]);
-
-        let sync = Synchronizer::new(cache.clone(), client, 100);
-        let result = sync.process_slot_range(100, 105).await.unwrap();
-
-        assert_eq!(result, 3);
-        assert!(cache.contains(100));
-        assert!(cache.contains(102));
-        assert!(cache.contains(104));
-        assert!(!cache.contains(101));
-        assert!(!cache.contains(103));
+        Ok(sub_intervals)
     }
 }

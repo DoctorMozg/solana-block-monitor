@@ -1,35 +1,28 @@
 use solana_client::nonblocking::rpc_client::RpcClient;
-use std::sync::Arc;
+use solana_sdk::commitment_config::CommitmentConfig;
 
-type ClientError = Box<dyn std::error::Error + Send + Sync>;
-
-#[async_trait::async_trait]
-pub trait ApiClient {
-    async fn get_block(&self) -> Result<u64, ClientError>;
-    async fn get_blocks(&self, start_slot: u64, end_slot: u64) -> Result<Vec<u64>, ClientError>;
-}
+use crate::types::BoxError;
 
 pub struct SyndicaClient {
-    rpc_client: Arc<RpcClient>,
+    rpc_client: RpcClient,
 }
 
 impl SyndicaClient {
-    pub fn new(rpc_url: String) -> Self {
-        let rpc_client = RpcClient::new(rpc_url);
-        Self {
-            rpc_client: Arc::new(rpc_client),
-        }
+    pub fn new(rpc_url: String, key: String) -> Self {
+        let connection_url = format!("{}/{}", rpc_url, key);
+        let rpc_client =
+            RpcClient::new_with_commitment(connection_url, CommitmentConfig::confirmed());
+        Self { rpc_client }
     }
 }
 
-#[async_trait::async_trait]
-impl ApiClient for SyndicaClient {
-    async fn get_block(&self) -> Result<u64, ClientError> {
+impl SyndicaClient {
+    pub async fn get_slot(&self) -> Result<u64, BoxError> {
         let slot = self.rpc_client.get_slot().await?;
         Ok(slot)
     }
 
-    async fn get_blocks(&self, start_slot: u64, end_slot: u64) -> Result<Vec<u64>, ClientError> {
+    pub async fn get_blocks(&self, start_slot: u64, end_slot: u64) -> Result<Vec<u64>, BoxError> {
         let blocks = self
             .rpc_client
             .get_blocks(start_slot, Some(end_slot))

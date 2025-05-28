@@ -1,6 +1,19 @@
 use scc::HashCache;
 use tracing::{debug, info, warn};
 
+/// A simple in-memory cache for storing confirmed block numbers.
+///
+/// This implementation uses a concurrent hash map (scc::HashCache) for:
+/// - Fast implementation: Uses existing concurrent hash map implementation
+/// - Good performance: O(1) lookups and inserts
+/// - Thread safety: Built-in concurrent access support
+/// - Memory efficiency: Only stores block numbers as keys
+///
+/// Alternative approach:
+/// - Sparse set: Could be more memory efficient but requires more complex implementation
+///
+/// The current implementation prioritizes simplicity and correctness over
+/// memory optimization, which is appropriate for testing purposes.
 pub struct BlockCache {
     cache: HashCache<u64, ()>,
 }
